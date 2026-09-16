@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lobsterai2api/internal/auth"
+	"lobsterai2api/internal/dotenv"
 	"lobsterai2api/internal/pool"
 	"lobsterai2api/internal/scheduler"
 	"lobsterai2api/internal/server"
@@ -19,6 +20,13 @@ import (
 )
 
 func main() {
+	// 先加载 .env（若存在），让 LB2A_* 不用每次在终端 export；真实环境变量优先。
+	if path, err := dotenv.LoadDefault(); err != nil {
+		log.Fatalf("load env: %v", err)
+	} else if path != "" {
+		log.Printf("loaded env from %s", path)
+	}
+
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 

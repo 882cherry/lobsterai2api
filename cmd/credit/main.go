@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"lobsterai2api/internal/dotenv"
 )
 
 func serverBase() string {
@@ -101,6 +103,11 @@ func fetchQuota(af *authFile) (remain, total int64, err error) {
 }
 
 func main() {
+	// 先加载 .env（若存在），省去每次手动 export LB2A_UPSTREAM_BASE。
+	if _, err := dotenv.LoadDefault(); err != nil {
+		fmt.Fprintf(os.Stderr, "credit: load env: %v\n", err)
+		os.Exit(1)
+	}
 	pretty := len(os.Args) > 1 && os.Args[1] == "-pretty"
 	authDir := "./auths"
 	if v := os.Getenv("LB2A_AUTH_DIR"); v != "" {

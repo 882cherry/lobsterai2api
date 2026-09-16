@@ -2,6 +2,8 @@
 config.json
 auths/
 data/
+.env
+.env.local
 
 # 编译产物
 *.exe

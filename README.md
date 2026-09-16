@@ -118,6 +118,37 @@ See `config.example.json`. Environment variable prefix `LB2A_*`:
 | `LB2A_TIMEOUT_SECONDS` | Upstream timeout |
 | `LB2A_UPSTREAM_BASE` | Upstream API base URL (required) |
 | `LB2A_LOGIN_PORTAL` | Login portal URL for OAuth flow (required for login) |
+| `LB2A_ENV_FILE` | Path to the `.env` file (default: `./.env`, else `.env` next to the executable) |
+
+### `.env` file
+
+Every binary loads `.env` at startup, so the values above don't have to be exported in each
+terminal (and don't belong in `~/.bashrc`). Copy the template and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+```ini
+LB2A_UPSTREAM_BASE=https://your-upstream-host
+LB2A_LOGIN_PORTAL=https://your-portal-host
+```
+
+Lookup order:
+
+1. `$LB2A_ENV_FILE`, if set (missing file or bad syntax → startup fails with the reason)
+2. `./.env` — the working directory
+3. `.env` next to the executable — covers double-clicking the exe on Windows and
+   service/scheduled-task starts, where the working directory is not the install directory
+
+Rules:
+
+- Real environment variables always win over `.env`, so a one-off
+  `LB2A_LISTEN=:9999 ./lobsterai2api` still overrides the file. Inside the file, a later line
+  overrides an earlier one for the same key.
+- Syntax: `KEY=VALUE`, `#` comments, optional `export ` prefix, optional matching quotes.
+  A malformed line aborts startup with a `file:line` message instead of being ignored silently.
+- `.env` is gitignored. The same file can be passed to a container with `docker run --env-file .env`.
 
 ## Features
 

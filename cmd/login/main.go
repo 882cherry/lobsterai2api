@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"lobsterai2api/internal/dotenv"
 )
 
 const (
@@ -425,6 +427,10 @@ func runAll() {
 }
 
 func main() {
+	// 先加载 .env（若存在），省去每次手动 export LB2A_UPSTREAM_BASE / LB2A_LOGIN_PORTAL。
+	if _, err := dotenv.LoadDefault(); err != nil {
+		fatal("load env: %v", err)
+	}
 	if len(os.Args) < 2 {
 		runAll()
 		return
