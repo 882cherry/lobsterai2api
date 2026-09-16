@@ -30,10 +30,31 @@ echo "============================================================"
 echo ""
 
 echo "正在启动本地回调服务器并生成登录链接..."
-AUTH_URL=$("$LOGIN_BIN" url) || {
-    echo "启动回调服务器失败"
-    exit 1
+# url 子命令会一直阻塞到回调完成，所以必须放后台跑：
+# 若写成 AUTH_URL=$("$LOGIN_BIN" url)，命令替换会等进程退出才赋值，
+# 登录链接就只能在登录完成后才显示出来，用户无从打开。
+URL_OUT="$(mktemp)"
+URL_PID=""
+cleanup() {
+    [[ -n "$URL_PID" ]] && kill "$URL_PID" 2>/dev/null || true
+    [[ -n "$URL_OUT" ]] && rm -f "$URL_OUT"
 }
+trap cleanup EXIT
+
+"$LOGIN_BIN" url >"$URL_OUT" 2>&1 &
+URL_PID=$!
+
+AUTH_URL=""
+for _ in $(seq 1 100); do  # 最多等 10s
+    AUTH_URL="$(head -n 1 "$URL_OUT" 2>/dev/null || true)"
+    [[ -n "$AUTH_URL" ]] && break
+    sleep 0.1
+done
+if [[ -z "$AUTH_URL" ]]; then
+    echo "启动回调服务器失败："
+    cat "$URL_OUT"
+    exit 1
+fi
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
