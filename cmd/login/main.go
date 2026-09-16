@@ -1,13 +1,17 @@
 // login.go — LobsterAI OAuth 登录（本地回调服务器模式）。
 //
-// 两个子命令，由 login.sh 顺序驱动：
+// 三个入口，由 login.sh 顺序驱动或直接调用：
 //
-//	login url   → 本地起 127.0.0.1 回调服务器，打印登录 URL，状态落 /tmp/lb2api-login-state.json
+//	login url   → 本地起 127.0.0.1 回调服务器，打印登录 URL，状态落临时目录
 //	login poll  → 读 state，等待回调，收到 code 后 POST /api/auth/exchange 换 token，
 //	              写 auths/lobsterai-{uid}.json，stdout 打印 token+account JSON
+//	login（无参数）→ url + poll 一步完成，适合 Windows（无 bash 依赖）
 //
 // 认证流程：浏览器打开 {server}/login?source=electron&redirect_uri=http://127.0.0.1:{port}/auth/callback&state={state}
 // 回调带 ?code=X&state=Y → exchange code → accessToken + refreshToken。
+//
+// 平台注意：url 与 poll 之间通过临时文件传递状态，路径由 os.TempDir() 决定
+// （Windows 为 %TEMP%，类 Unix 为 $TMPDIR 或 /tmp），不再硬编码 /tmp。
 package main
 
 import (
@@ -29,13 +33,37 @@ import (
 )
 
 const (
-	clientUA        = "LobsterAI/0.1.0"
-	stateFile       = "/tmp/lb2api-login-state.json"
-	authsDir        = "./auths"
-	callbackPath    = "/auth/callback"
-	callbackTimeout = 10 * time.Minute
+	clientUA          = "LobsterAI/0.1.0"
+	authsDir          = "./auths"
+	callbackPath      = "/auth/callback"
+	callbackTimeout   = 10 * time.Minute
 	loginCallbackHost = "127.0.0.1"
+
+	// stateFileEnv 覆盖 url/poll 之间的状态文件路径（多实例并行登录时用）。
+	stateFileEnv = "LB2A_LOGIN_STATE_FILE"
+	// authDirEnv 与 server 端 LB2A_AUTH_DIR 共用，保证 auth 文件落在服务读取的目录。
+	authDirEnv = "LB2A_AUTH_DIR"
+	// noBrowserEnv 非空则 one-shot 模式不自动打开浏览器。
+	noBrowserEnv = "LB2A_NO_BROWSER"
 )
+
+// stateFilePath url/poll 传递登录状态的临时文件。
+// 放在 os.TempDir()（Windows: %TEMP%，类 Unix: $TMPDIR 或 /tmp）——
+// 硬编码 /tmp 在 Windows 上会被解析成当前盘符根目录下的 \tmp\，通常不存在导致写盘失败。
+func stateFilePath() string {
+	if v := os.Getenv(stateFileEnv); v != "" {
+		return v
+	}
+	return filepath.Join(os.TempDir(), "lb2api-login-state.json")
+}
+
+// authDirPath auth 文件落盘目录；LB2A_AUTH_DIR 优先，与 server 保持一致。
+func authDirPath() string {
+	if v := os.Getenv(authDirEnv); v != "" {
+		return v
+	}
+	return authsDir
+}
 
 // serverBase reads upstream API base from LB2A_UPSTREAM_BASE env.
 func serverBase() string {
@@ -157,11 +185,14 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// runUrl 启动本地回调服务器并打印登录 URL。
-func runUrl() {
+// runUrl 启动本地回调服务器并打印登录 URL，阻塞至回调完成或超时。
+// autoOpen 为真时顺带用系统默认浏览器打开登录 URL（失败只提示，不影响流程）。
+// 返回 exchange 结果 JSON（超时/失败为 nil）；结果同时落盘供 poll 子命令读取。
+func runUrl(autoOpen bool) []byte {
+	sf := stateFilePath()
 	// 清理上一次登录残留（否则旧 .result 会让等待循环立刻误判完成）
-	os.Remove(stateFile + ".result")
-	os.Remove(stateFile)
+	os.Remove(sf + ".result")
+	os.Remove(sf)
 	state := randomHex(16)
 	uuid := newUuid()
 	firstKeyfrom := nowMillis()
@@ -175,6 +206,7 @@ func runUrl() {
 
 	mux := http.NewServeMux()
 	var mu sync.Mutex
+	var result []byte
 	mux.HandleFunc(callbackPath, func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -196,7 +228,8 @@ func runUrl() {
 		}
 		outRaw := exchange(ls, code)
 		if outRaw != nil {
-			_ = os.WriteFile(stateFile+".result", outRaw, 0o600)
+			_ = os.WriteFile(sf+".result", outRaw, 0o600)
+			result = outRaw
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, "<html><body><h2>登录成功，可以关闭此窗口了</h2></body></html>")
@@ -215,7 +248,7 @@ func runUrl() {
 		FirstKeyfrom: firstKeyfrom,
 	}
 	raw, _ := json.Marshal(ls)
-	if err := os.WriteFile(stateFile, raw, 0o600); err != nil {
+	if err := os.WriteFile(sf, raw, 0o600); err != nil {
 		fatal("write state: %v", err)
 	}
 
@@ -226,18 +259,23 @@ func runUrl() {
 	loginURL := fmt.Sprintf("%s/portal#/login?source=electron&redirect_uri=%s&state=%s",
 		loginPortalURL(), urlQueryEscape(redirectURI), state)
 	fmt.Println(loginURL)
+	if autoOpen {
+		openBrowser(loginURL)
+	}
 
 	// 等待回调完成或超时后自动关闭
 	deadline := time.Now().Add(callbackTimeout)
 	for {
-		if _, err := os.Stat(stateFile + ".result"); err == nil {
-			time.Sleep(500 * time.Millisecond) // 给 poll 一点读取窗口
+		mu.Lock()
+		done := result
+		mu.Unlock()
+		if done != nil {
 			_ = srv.Close()
-			return
+			return done
 		}
 		if time.Now().After(deadline) {
 			_ = srv.Close()
-			return
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -306,7 +344,8 @@ func exchange(ls loginState, code string) []byte {
 	}
 
 	// 写 auth 文件
-	if err := os.MkdirAll(authsDir, 0o755); err != nil {
+	dir := authDirPath()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "login: mkdir auths: %v\n", err)
 		return nil
 	}
@@ -333,7 +372,7 @@ func exchange(ls loginState, code string) []byte {
 		},
 	}
 	outRaw, _ := json.MarshalIndent(doc, "", "  ")
-	fp := filepath.Join(authsDir, fmt.Sprintf("lobsterai-%s.json", uid))
+	fp := filepath.Join(dir, fmt.Sprintf("lobsterai-%s.json", uid))
 	if err := os.WriteFile(fp, outRaw, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "login: write auth: %v\n", err)
 		return nil
@@ -355,29 +394,49 @@ func exchange(ls loginState, code string) []byte {
 
 // runPoll 等待 login url 完成（读取 .result 文件）。
 func runPoll() {
+	sf := stateFilePath()
 	deadline := time.Now().Add(callbackTimeout)
 	for time.Now().Before(deadline) {
-		if raw, err := os.ReadFile(stateFile + ".result"); err == nil {
+		if raw, err := os.ReadFile(sf + ".result"); err == nil {
 			fmt.Println(string(raw))
-			os.Remove(stateFile + ".result")
-			os.Remove(stateFile)
+			os.Remove(sf + ".result")
+			os.Remove(sf)
 			return
 		}
 		time.Sleep(time.Second)
 	}
-	fatal("登录超时（5 分钟内未完成）")
+	fatal("登录超时（%s 内未完成）", callbackTimeout)
+}
+
+// runAll 一步完成 url + poll：起回调服务器 → 打印/打开登录 URL → 等回调 → 落盘 auth。
+// 不依赖 bash，Windows 上直接 `login.exe` 即可。
+func runAll() {
+	sf := stateFilePath()
+	res := runUrl(true) // 阻塞至回调完成或超时，期间已打印登录 URL
+	if res == nil {
+		_ = os.Remove(sf)
+		_ = os.Remove(sf + ".result")
+		fatal("登录超时（%s 内未完成）", callbackTimeout)
+	}
+	// runUrl 已把 .result 落盘，这里清理临时状态，结果只从 stdout 输出
+	_ = os.Remove(sf)
+	_ = os.Remove(sf + ".result")
+	fmt.Println(string(res))
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+		runAll()
+		return
 	}
 	switch os.Args[1] {
 	case "url":
-		runUrl()
+		runUrl(false)
 	case "poll":
 		runPoll()
+	case "all":
+		runAll()
 	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+		fatal("unknown subcommand %q (want url|poll|all)", os.Args[1])
 	}
 }
